@@ -4,7 +4,8 @@
 
 1. **租约（Lease）**：同一资源同一时刻至多一个有效持有者；未过期不可抢占，过期后可被重新获取；
 2. **栅栏令牌（Fencing Token）+ 有序写入**：领导权每变更一次令牌递增，旧领导/过期令牌的写入被**显式拒绝**，同一请求重放不产生重复副作用；
-3. **故障与时间异常收敛**：节点崩溃/进程重启后从 WAL 重放恢复；判定只依赖单调时钟，墙上时钟回拨/抖动不会造成重复授予或错误拒绝。
+3. **计划内换主（Leadership Handover）**：持有者可把领导权主动交接给指定继任者，继任者立即以严格更大的令牌上任，无需等旧租约到期；交接后旧令牌的提交一律显式拒绝（含曾经落库成功的请求）；
+4. **故障与时间异常收敛**：节点崩溃/进程重启后从 WAL 重放恢复，落盘到一半留下的残缺尾部记录被安全丢弃；判定只依赖单调时钟，墙上时钟回拨/抖动不会造成重复授予或错误拒绝。
 
 工程为 Spring Boot 3.4 / Java 21，核心协调逻辑**不依赖 Spring 容器**，可直接用 JUnit 运行。
 
@@ -18,8 +19,8 @@ LocalCluster（进程内集群：1 个可控时钟 + 1 个共享状态库 + N �
 ├── ClusterStateStore     共享持久化状态库：每资源线性化 + WAL 追加(fsync) + 重放恢复
 │   └── ResourceState     单资源状态：租约槽 / 已签发令牌集合 / 幂等写入台账 / 副作用序号
 ├── LogicalNode           逻辑成员：crash() 丢内存态，restart() 重新挂接存储
-├── LeaseService          acquire / renew / release / inspect
-└── WriteService          submit（栅栏令牌校验 + 幂等重放 + 顺序序号）
+├── LeaseService          acquire / renew / release / handover / inspect
+└── WriteService          submit（栅栏令牌校验 + 幂等重放 + 顺序序号）/ committedSequence
 ```
 
 存储模拟的是 etcd / ZooKeeper 一类的**共识存储**：所有节点共享一份权威状态，
@@ -60,6 +61,7 @@ LocalCluster（进程内集群：1 个可控时钟 + 1 个共享状态库 + N �
 | | | `ALREADY_RELEASED`：已被释放 |
 | | | `EXPIRED`：已过期（含恰好到期），过期租约**不能靠续约复活**，必须重新获取 |
 | `release(holder)` | 持有者本人、未释放、未过期 → 置 `released`，他人立即可重新获取 | 原因码同上；对已释放租约**重复释放** → `ALREADY_RELEASED` |
+| `handover(holder, successor, ttl)` | 持有者本人、未释放、未过期、继任者合法 → **立即**把领导权交给继任者：签发严格更大的新令牌、旧令牌进入"交接作废台账"、新租约有效期从交接时刻起算 ttl，revision+1 | `UNKNOWN_LEASE` / `NOT_HOLDER` / `ALREADY_RELEASED` / `EXPIRED` / `INVALID_SUCCESSOR`（继任者为空或与当前持有者相同），原因码类型为 `HandoverRejectReason` |
 | `inspect()` | 返回当前租约快照（不做状态变更） | — |
 
 **互斥不变量**：在任意单调时刻 t，对同一资源，至多一个 `(holder, token)` 满足
@@ -76,15 +78,19 @@ LocalCluster（进程内集群：1 个可控时钟 + 1 个共享状态库 + N �
 
 `submit(resourceId, nodeId, token, idempotencyKey, payload)` → `WriteOutcome(accepted, replay, appliedToken, sequence, idempotencyKey, message)`
 
-1. **幂等重放优先**：幂等键已在台账中 → 原样返回首次结果（`replay=true`、原 `sequence`），
+1. **交接作废令牌最优先**：令牌已被计划内换主显式作废 → `HANDOVER_SUPERSEDED`。
+   即使幂等键命中（该请求之前确实成功落过库）也**绝不按重复提交放行**。
+2. **幂等重放**：幂等键已在台账中 → 原样返回首次结果（`replay=true`、原 `sequence`），
    即使提交者已不是领导、即使这是崩溃恢复后的重放。**绝不产生第二次副作用**。
-2. **`UNKNOWN_TOKEN`**：令牌从未被本资源签发过（伪造/串资源）。
-3. **`STALE_TOKEN`**：令牌签发过，但租约槽当前令牌更大 —— 已发生领导权变更，旧领导被拒。
-4. **`LEASE_EXPIRED`**：令牌仍在槽位上，但提交者不是持有者、租约已释放或 `expiresAtMono <= nowMono`。
-5. **接受**：分配资源内单调递增的副作用序号 `sequence`（1,2,3,…），与令牌、幂等键、载荷一起写 WAL；
+3. **`UNKNOWN_TOKEN`**：令牌从未被本资源签发过（伪造/串资源）。
+4. **`STALE_TOKEN`**：令牌签发过，但租约槽当前令牌更大 —— 已发生领导权变更，旧领导被拒。
+5. **`LEASE_EXPIRED`**：令牌仍在槽位上，但提交者不是持有者、租约已释放或 `expiresAtMono <= nowMono`。
+6. **接受**：分配资源内单调递增的副作用序号 `sequence`（1,2,3,…），与令牌、幂等键、载荷一起写 WAL；
    下游存储可用 `(token, sequence)` 丢弃任何乱序/重复请求。
 
 > 拒绝都以异常显式抛出（`CoordinationException.reason()`），不存在"静默接受"。
+> `committedSequence(resourceId)` 可随时查询已提交到的最大序号（无写入为 0），
+> 供继任者从已知进度接着写。
 
 ### 3.2 领导权变更示例
 
@@ -95,6 +101,31 @@ A 用 token=1 迟到提交 → STALE_TOKEN
 B write(req-2) → seq=2
 req-1 重放（同幂等键）→ replay=true, seq=1，无新副作用
 ```
+
+### 3.3 计划内换主（主动交接）
+
+发版、缩容等场景下，当前持有者可**指名继任者**主动交出领导权，不必干等租约自然过期：
+
+```
+A acquire → token=1，write(step-1, step-2) → seq=1,2
+A handover → B：token=2 立即生效（旧租约远未到期也无所谓），token=1 进入交接作废台账
+B committedSequence → 2（从已知进度接续）
+B write(step-3) → seq=3（顺排不跳号、不覆盖已提交内容）
+A 用 token=1 提交新请求        → HANDOVER_SUPERSEDED
+A 用 token=1 重发已落库的 step-1 → HANDOVER_SUPERSEDED（不按重复提交放行！）
+B 用 token=2 重发 step-3      → replay=true, seq=3（真重放仍幂等，无第二次副作用）
+```
+
+交接规则与既有语义的**兼容边界**：
+
+* 交接与获取/续约/释放共用同一资源临界区，换牌是原子的 —— 并发交接、交接与抢锁交错时，
+  任何时刻同一资源仍至多一个有效持有者（见 `LeadershipHandoverTest` 并发用例）。
+* 交接是令牌的**显式作废**，与自然过期/释放的**隐式失效**区别对待：
+  被交接作废的令牌命中幂等键也拒绝（`HANDOVER_SUPERSEDED`）；
+  而自然过期/领导更替后，旧请求的幂等重放**仍按原语义返回首次结果**（既有用例不回归）。
+* 交接本身不等价于释放：旧租约槽被整体替换为继任者的新租约（新令牌、新过期时刻、revision+1），
+  旧持有者事后的续约/释放/写入都会因 `NOT_HOLDER` / `HANDOVER_SUPERSEDED` 被拒。
+* 交接记录（`H`）同样进 WAL：进程重启后交接结果、作废令牌台账一并恢复。
 
 ---
 
@@ -109,9 +140,11 @@ req-1 重放（同幂等键）→ replay=true, seq=1，无新副作用
 | 租约 | `EXPIRED` | 租约已过期：续约/释放失效租约 |
 | 租约 | `ALREADY_RELEASED` | 已释放后重复释放 / 续约 |
 | 租约 | `UNKNOWN_LEASE` | 资源上无任何租约 |
+| 交接 | `UNKNOWN_LEASE` / `NOT_HOLDER` / `ALREADY_RELEASED` / `EXPIRED` / `INVALID_SUCCESSOR` | 交接发起非法（`HandoverRejectReason`，与租约原因码类型区分） |
 | 写入 | `UNKNOWN_TOKEN` | 令牌从未签发 |
 | 写入 | `STALE_TOKEN` | 旧领导令牌（已有更大令牌） |
 | 写入 | `LEASE_EXPIRED` | 非持有者 / 已释放 / 已过期 |
+| 写入 | `HANDOVER_SUPERSEDED` | 令牌已被计划内换主显式作废（命中幂等键也不放行） |
 
 ### 4.2 节点崩溃与重启
 
@@ -126,13 +159,20 @@ req-1 重放（同幂等键）→ replay=true, seq=1，无新副作用
 用**同一数据目录**重新构造 `ClusterStateStore` 即模拟整个进程重启：
 
 1. 扫描 `wal/` 目录逐资源重放；
-2. `G`(授予) / `N`(续约) / `R`(释放) 重建租约槽（持有者、令牌、过期时刻、revision）；
+2. `G`(授予) / `N`(续约) / `R`(释放) / `H`(交接) 重建租约槽（持有者、令牌、过期时刻、revision）
+   与交接作废令牌台账；
 3. `W`(写入) 重建幂等台账与 `lastSequence`；
 4. `issuedTokens` 与 `nextToken` 一并恢复 —— 重启后新授予的令牌**接续递增，不会重复签发**。
 
 原子性：WAL 追加在资源临界区内、操作返回前完成（行式记录 + fsync）。
 崩溃只会发生在"记录落盘前"（调用方视为失败，可安全重试）或"落盘后"（重放恢复），
-不存在"调用成功但状态丢失"或"半截记录"。
+不存在"调用成功但状态丢失"。
+
+**落盘到一半（残缺尾巴）**：进程若正好在写 WAL 时崩掉，文件尾部可能留下半条记录。
+由于追加是严格顺序的，损坏只可能出现在尾部 —— 重放遇到第一条无法解码的记录即
+停止该文件的重放（`[WAL-截断]` 警告日志）：服务照常启动，回到最后一次完整提交的状态；
+残缺尾巴不被当作已生效写入，已确认的写入不丢，序号从恢复点继续发放、不重复发号
+（见 `TornWalRecoveryTest`）。
 
 ### 4.4 时间异常
 
@@ -148,6 +188,7 @@ req-1 重放（同幂等键）→ replay=true, seq=1，无新副作用
 | `G` | `G\|token\|wall\|mono\|expiresMono\|revision\|holderB64` | 全新授予 |
 | `N` | `N\|token\|expiresMono\|revision` | 续约 |
 | `R` | `R\|token\|revision` | 释放 |
+| `H` | `H\|oldToken\|newToken\|wall\|mono\|expiresMono\|revision\|successorB64` | 计划内换主（旧令牌作废、继任者立即上任） |
 | `W` | `W\|token\|sequence\|keyB64\|payloadB64` | 写入生效 |
 
 字符串字段以 Base64 编码，保证不含分隔符；文件名对 resourceId 做 URL 编码。
@@ -162,12 +203,14 @@ req-1 重放（同幂等键）→ replay=true, seq=1，无新副作用
 mvn test
 ```
 
-12 个用例（外加 Spring 上下文冒烟测试），覆盖：
+16 个用例（外加 Spring 上下文冒烟测试），覆盖：
 
 | 测试类 | 覆盖点 |
 |---|---|
 | `LeaseLifecycleTest` | 获取/幂等重复获取/续约/释放/重复释放；未过期不可抢占；过期后续约被拒(`EXPIRED`)、可被重新获取；`NOT_HOLDER`/`UNKNOWN_LEASE` 等原因区分 |
 | `FencedWriteTest` | 领导权变更后旧令牌 `STALE_TOKEN`；未换领导但租约过期 `LEASE_EXPIRED`；未知令牌 `UNKNOWN_TOKEN`；同键重放无重复副作用、序号不跳 |
+| `LeadershipHandoverTest` | 交接立即生效、令牌严格更大、继任者查进度续写；旧令牌新写与旧令牌重放均 `HANDOVER_SUPERSEDED`；真重放仍幂等；五类交接拒绝原因；并发交接+抢锁恰好 1 次交接成功、0 次抢锁成功、终态唯一持有者 |
+| `TornWalRecoveryTest` | WAL 尾部残缺记录不阻止启动、不算已生效；已确认写入保留且重放幂等；交接状态经 WAL 恢复；序号接续发放不重复 |
 | `ConcurrentContentionTest` | 16 线程同起跑线竞争 → **恰好 1 个成功**、其余全部 `HELD_BY_OTHER`；12 线程同键并发提交 → 恰好 1 次副作用、其余为重放 |
 | `NodeCrashRecoveryTest` | 领导者崩溃期间无双重持有者；重启后续约/幂等重放正常；进程级重启重放 WAL，令牌接续递增、旧令牌仍被拒 |
 | `ClockAnomalyTest` | 墙上时钟回拨 1 小时 + 抖动不改变任何判定；单调时钟严格只增 |
@@ -187,8 +230,11 @@ cat target/surefire-reports/com.github.h3yow.leasecoordinationjava.tests.coordin
 ```
 [ACQUIRE-拒绝] resource=/res/order-1 node=node-2 持有者=node-1 token=1 未过期 (expiresAtMono=1000 > nowMono=100, 剩余=900ms) → HELD_BY_OTHER
 [RENEW-成功] resource=/res/order-1 node=node-1 token=1 revision=1→2 nowMono=200 ttl=1000ms 新expiresAtMono=1200 → WAL落盘
+[HANDOVER-成功] resource=/res/rolling-upgrade node-1→node-2 token=1→2 revision=2 wall=... mono=0 ttl=60000ms 新expiresAtMono=60000 旧令牌已作废 → WAL落盘，继任者立即生效（无需等旧租约到期）
+[WRITE-拒绝] resource=/res/rolling-upgrade node=node-1 key=step-1 token=1 nowMono=0 当前token=2 该幂等键曾落库=true → HANDOVER_SUPERSEDED（令牌已被计划内换主作废，不做幂等放行）
 [WRITE-拒绝] resource=/res/account-7 node=node-1 key=req-stale token=1 当前token=2 nowMono=1000 → STALE_TOKEN（旧领导，已发生领导权变更）
 [WRITE-重放] resource=/res/account-8 node=node-1 key=order-1001 token=1 命中首次结果 seq=1 首次token=1 nowMono=600 → replay=true，无新副作用
+[WAL-截断] file=%2Fres%2Ftorn-tail.log 第6条记录无法解码（落盘到一半崩溃的残缺尾巴），停止重放该文件，已恢复5条完整记录。坏行内容=W|2|4|aGVh
 WAL 重放完成 resource=/res/durable-kv file=%2Fres%2Fdurable-kv.log 记录数=3 lastToken=1 lastSeq=1
 [CLOCK] 墙上时钟回拨/抖动后 wall=... ，单调时钟仍为 mono=0
 ```
@@ -206,8 +252,8 @@ WAL 重放完成 resource=/res/durable-kv file=%2Fres%2Fdurable-kv.log 记录数
 ```
 coordination/
 ├── clock/    TimeSource, SimulatedClock
-├── storage/  ResourceState, ClusterStateStore（含 WAL 记录 sealed 模型）
-├── lease/    Lease, LeaseRejectReason, CoordinationException, LeaseService
+├── storage/  ResourceState, ClusterStateStore（含 WAL 记录 sealed 模型，截断容忍重放）
+├── lease/    Lease, LeaseRejectReason, HandoverRejectReason, CoordinationException, LeaseService
 ├── write/    WriteRejectReason, WriteOutcome, WriteService
 └── cluster/  LogicalNode, LocalCluster
 ```

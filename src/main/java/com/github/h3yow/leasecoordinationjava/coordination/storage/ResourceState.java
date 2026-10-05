@@ -33,6 +33,8 @@ public class ResourceState {
     public final Set<Long> issuedTokens = new HashSet<>();
     /** 下一次全新授予使用的令牌，从 1 开始单调递增，只增不减。 */
     public long nextToken = 1L;
+    /** 被计划内换主显式作废的令牌：这些令牌的提交一律拒绝，不走幂等重放放行。 */
+    public final Set<Long> handoverSupersededTokens = new HashSet<>();
 
     // ---- 写入台账 ----
     public final Map<String, AppliedWrite> appliedWrites = new HashMap<>();

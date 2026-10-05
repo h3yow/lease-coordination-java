@@ -47,7 +47,7 @@ public class ClusterStateStore implements AutoCloseable {
 
     /** WAL 记录：单资源日志，故记录内不再携带 resourceId。 */
     public sealed interface WalRecord
-            permits LeaseGrant, LeaseRenew, LeaseRelease, WriteApplied {
+            permits LeaseGrant, LeaseRenew, LeaseRelease, LeaseHandover, WriteApplied {
 
         String encode();
 
@@ -63,6 +63,11 @@ public class ClusterStateStore implements AutoCloseable {
                         Long.parseLong(p[1]), Long.parseLong(p[2]), Integer.parseInt(p[3]));
                 case "R" -> new LeaseRelease(
                         Long.parseLong(p[1]), Integer.parseInt(p[2]));
+                case "H" -> new LeaseHandover(
+                        Long.parseLong(p[1]), Long.parseLong(p[2]),
+                        Long.parseLong(p[3]), Long.parseLong(p[4]),
+                        Long.parseLong(p[5]), Integer.parseInt(p[6]),
+                        new String(b64.decode(p[7])));
                 case "W" -> new WriteApplied(
                         Long.parseLong(p[1]), Long.parseLong(p[2]),
                         new String(b64.decode(p[3])), new String(b64.decode(p[4])));
@@ -97,6 +102,22 @@ public class ClusterStateStore implements AutoCloseable {
         @Override
         public String encode() {
             return "R|" + fencingToken + '|' + revision;
+        }
+    }
+
+    /**
+     * 计划内换主：旧令牌被显式作废，继任者立即以严格更大的新令牌上任。
+     * 重放时旧令牌进入 {@code handoverSupersededTokens}，其后的旧令牌提交一律拒绝。
+     */
+    public record LeaseHandover(long oldToken, long newToken, long acquiredAtWall,
+                                long acquiredAtMono, long expiresAtMono, int revision,
+                                String successorId) implements WalRecord {
+        @Override
+        public String encode() {
+            return "H|" + oldToken + '|' + newToken + '|' + acquiredAtWall + '|'
+                    + acquiredAtMono + '|' + expiresAtMono + '|' + revision + '|'
+                    + Base64.getEncoder().encodeToString(
+                            successorId.getBytes(StandardCharsets.UTF_8));
         }
     }
 
@@ -201,6 +222,11 @@ public class ClusterStateStore implements AutoCloseable {
         }
     }
 
+    /**
+     * 重放单个日志文件。追加是顺序的，损坏只可能出现在尾部（落盘到一半进程崩溃），
+     * 因此遇到第一条无法解码的记录即停止重放该文件：残缺尾巴既不阻止启动，
+     * 也不被当作已生效写入；之前的完整记录全部保留，序号从恢复点继续发放。
+     */
     private static int replayInto(Path file, ResourceState s) {
         int n = 0;
         try (BufferedReader br = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
@@ -209,13 +235,26 @@ public class ClusterStateStore implements AutoCloseable {
                 if (line.isBlank()) {
                     continue;
                 }
-                applyRecord(s, WalRecord.decode(line));
+                WalRecord record;
+                try {
+                    record = WalRecord.decode(line);
+                } catch (RuntimeException corrupt) {
+                    log.warn("[WAL-截断] file={} 第{}条记录无法解码（落盘到一半崩溃的残缺尾巴），"
+                                    + "停止重放该文件，已恢复{}条完整记录。坏行内容={}",
+                            file.getFileName(), n + 1, n, abbreviate(line));
+                    break;
+                }
+                applyRecord(s, record);
                 n++;
             }
         } catch (IOException e) {
             throw new UncheckedIOException("重放 WAL 失败: " + file, e);
         }
         return n;
+    }
+
+    private static String abbreviate(String line) {
+        return line.length() <= 80 ? line : line.substring(0, 80) + "…";
     }
 
     private static void applyRecord(ResourceState s, WalRecord r) {
@@ -242,6 +281,18 @@ public class ClusterStateStore implements AutoCloseable {
                     s.released = true;
                     s.revision = rel.revision();
                 }
+            }
+            case LeaseHandover h -> {
+                s.hasLease = true;
+                s.holderId = h.successorId();
+                s.fencingToken = h.newToken();
+                s.acquiredAtWall = h.acquiredAtWall();
+                s.acquiredAtMono = h.acquiredAtMono();
+                s.expiresAtMono = h.expiresAtMono();
+                s.released = false;
+                s.revision = h.revision();
+                s.handoverSupersededTokens.add(h.oldToken());
+                trackToken(s, h.newToken());
             }
             case WriteApplied w -> {
                 trackToken(s, w.fencingToken());

@@ -12,7 +12,9 @@ import org.slf4j.LoggerFactory;
  *
  * <p>提交按以下顺序判定，全部在资源的线性化临界区内完成：</p>
  * <ol>
- *   <li><b>幂等重放</b>：幂等键已存在 → 无论令牌是否仍有效，原样返回首次结果，
+ *   <li><b>交接作废令牌</b>：令牌已被计划内换主显式作废 →
+ *       {@link WriteRejectReason#HANDOVER_SUPERSEDED}，即使幂等键曾成功落库也不放行；</li>
+ *   <li><b>幂等重放</b>：幂等键已存在 → 原样返回首次结果，
  *       {@code replay=true}，绝不产生第二次副作用（崩溃前已落盘的提交重放安全）；</li>
  *   <li><b>旧领导 / 过期令牌</b>：令牌从未签发 → {@link WriteRejectReason#UNKNOWN_TOKEN}；
  *       令牌小于当前租约槽的令牌（已产生更新的领导） → {@link WriteRejectReason#STALE_TOKEN}；
@@ -33,6 +35,16 @@ public class WriteService {
         this.clock = clock;
     }
 
+    /** 查询该资源已提交到的最大副作用序号（无写入时为 0），供继任者从已知进度继续。 */
+    public long committedSequence(String resourceId) {
+        long nowMono = clock.monotonicMillis();
+        return store.compute(resourceId, s -> {
+            log.info("[SEQ-查询] resource={} nowMono={} lastSequence={}",
+                    resourceId, nowMono, s.lastSequence);
+            return ClusterStateStore.Result.of(s.lastSequence);
+        });
+    }
+
     public WriteOutcome submit(String resourceId, String nodeId, long fencingToken,
                                String idempotencyKey, String payload) {
         if (idempotencyKey == null || idempotencyKey.isBlank()) {
@@ -41,7 +53,21 @@ public class WriteService {
         long nowMono = clock.monotonicMillis();
 
         return store.compute(resourceId, s -> {
-            // 1) 幂等重放优先：同一请求重放不产生重复副作用，即使发起者已不是领导
+            // 0) 交接作废令牌最优先：计划内换主一旦生效，带旧令牌的提交一律显式拒绝，
+            //    即使幂等键命中（该请求之前确实成功落过库）也绝不按重放放行
+            if (s.handoverSupersededTokens.contains(fencingToken)) {
+                boolean hadApplied = s.appliedWrites.containsKey(idempotencyKey);
+                log.info("[WRITE-拒绝] resource={} node={} key={} token={} nowMono={} "
+                                + "当前token={} 该幂等键曾落库={} → HANDOVER_SUPERSEDED"
+                                + "（令牌已被计划内换主作废，不做幂等放行）",
+                        resourceId, nodeId, idempotencyKey, fencingToken, nowMono,
+                        s.hasLease ? s.fencingToken : -1L, hadApplied);
+                throw new CoordinationException(WriteRejectReason.HANDOVER_SUPERSEDED,
+                        "令牌 " + fencingToken + " 已被计划内换主显式作废，拒绝写入"
+                                + "（即使该请求曾成功落库也不按重放处理）");
+            }
+
+            // 1) 幂等重放：同一请求重放不产生重复副作用，即使发起者已不是领导
             ResourceState.AppliedWrite prior = s.appliedWrites.get(idempotencyKey);
             if (prior != null) {
                 log.info("[WRITE-重放] resource={} node={} key={} token={} 命中首次结果 "
