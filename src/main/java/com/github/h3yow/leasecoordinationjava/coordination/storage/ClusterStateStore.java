@@ -25,7 +25,8 @@ import org.slf4j.LoggerFactory;
  *   <li><b>线性化</b>：同一资源的所有 {@link #compute} 调用按每资源锁串行执行；</li>
  *   <li><b>持久性</b>：变更以 WAL 记录追加到 {@code <dataDir>/wal/<resource>.log}，
  *       追加后立即 {@code fsync}，返回成功即视为已落盘；</li>
- *   <li><b>可恢复</b>：打开目录时（以及节点重启重新打开时）重放全部 WAL 重建内存态。</li>
+ *   <li><b>可恢复</b>：打开目录时（以及节点重启重新打开时）重放全部 WAL 重建内存态；
+ *       落盘途中崩溃留下的不完整尾部记录会被截断丢弃，既不阻止启动也不算已生效写入。</li>
  * </ul>
  */
 public class ClusterStateStore implements AutoCloseable {
@@ -47,7 +48,7 @@ public class ClusterStateStore implements AutoCloseable {
 
     /** WAL 记录：单资源日志，故记录内不再携带 resourceId。 */
     public sealed interface WalRecord
-            permits LeaseGrant, LeaseRenew, LeaseRelease, WriteApplied {
+            permits LeaseGrant, LeaseRenew, LeaseRelease, LeaseHandover, WriteApplied {
 
         String encode();
 
@@ -63,6 +64,11 @@ public class ClusterStateStore implements AutoCloseable {
                         Long.parseLong(p[1]), Long.parseLong(p[2]), Integer.parseInt(p[3]));
                 case "R" -> new LeaseRelease(
                         Long.parseLong(p[1]), Integer.parseInt(p[2]));
+                case "H" -> new LeaseHandover(
+                        new String(b64.decode(p[7])), Long.parseLong(p[1]),
+                        Long.parseLong(p[2]), Long.parseLong(p[3]),
+                        Long.parseLong(p[4]), Integer.parseInt(p[5]),
+                        Long.parseLong(p[6]));
                 case "W" -> new WriteApplied(
                         Long.parseLong(p[1]), Long.parseLong(p[2]),
                         new String(b64.decode(p[3])), new String(b64.decode(p[4])));
@@ -97,6 +103,22 @@ public class ClusterStateStore implements AutoCloseable {
         @Override
         public String encode() {
             return "R|" + fencingToken + '|' + revision;
+        }
+    }
+
+    /**
+     * 计划内交接：当前持有者把领导权交给指定继任者。
+     * 与 {@link LeaseGrant} 一样占据租约槽并签发新令牌，
+     * 同时记录被取代的旧令牌 {@code supersededToken} 作为交接边界。
+     */
+    public record LeaseHandover(String holderId, long fencingToken, long acquiredAtWall,
+                                long acquiredAtMono, long expiresAtMono, int revision,
+                                long supersededToken) implements WalRecord {
+        @Override
+        public String encode() {
+            return "H|" + fencingToken + '|' + acquiredAtWall + '|' + acquiredAtMono + '|'
+                    + expiresAtMono + '|' + revision + '|' + supersededToken + '|'
+                    + Base64.getEncoder().encodeToString(holderId.getBytes(StandardCharsets.UTF_8));
         }
     }
 
@@ -203,19 +225,51 @@ public class ClusterStateStore implements AutoCloseable {
 
     private static int replayInto(Path file, ResourceState s) {
         int n = 0;
+        long goodOffset = 0; // 已确认完好的字节数（残缺尾部从这里截断）
         try (BufferedReader br = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
             String line;
             while ((line = br.readLine()) != null) {
+                // 本资源日志由我们自己以 '\n' 追加，行字节数 + 1 即含换行的偏移
+                long lineBytes = line.getBytes(StandardCharsets.UTF_8).length + 1L;
                 if (line.isBlank()) {
+                    goodOffset += lineBytes;
                     continue;
                 }
-                applyRecord(s, WalRecord.decode(line));
+                WalRecord record;
+                try {
+                    record = WalRecord.decode(line);
+                } catch (RuntimeException e) {
+                    // 落盘途中崩溃留下的不完整尾部：不是已生效写入，截断丢弃，
+                    // 既不能阻止启动，也不能参与状态重建
+                    log.warn("WAL 尾部残缺，截断并忽略 file={} 截断偏移={} 已重放={}条 "
+                                    + "残缺内容='{}' 判定依据={}",
+                            file, goodOffset, n, abbreviate(line), e);
+                    truncateTo(file, goodOffset);
+                    return n;
+                }
+                applyRecord(s, record);
                 n++;
+                goodOffset += lineBytes;
             }
         } catch (IOException e) {
             throw new UncheckedIOException("重放 WAL 失败: " + file, e);
         }
         return n;
+    }
+
+    private static void truncateTo(Path file, long size) {
+        try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(file,
+                java.nio.file.StandardOpenOption.WRITE)) {
+            ch.truncate(size);
+            ch.force(true);
+            log.info("WAL 残缺尾部已截断 file={} 保留字节={}", file, size);
+        } catch (IOException e) {
+            throw new UncheckedIOException("截断残缺 WAL 尾部失败: " + file, e);
+        }
+    }
+
+    private static String abbreviate(String line) {
+        return line.length() <= 64 ? line : line.substring(0, 64) + "…";
     }
 
     private static void applyRecord(ResourceState s, WalRecord r) {
@@ -242,6 +296,19 @@ public class ClusterStateStore implements AutoCloseable {
                     s.released = true;
                     s.revision = rel.revision();
                 }
+            }
+            case LeaseHandover h -> {
+                s.hasLease = true;
+                s.holderId = h.holderId();
+                s.fencingToken = h.fencingToken();
+                s.acquiredAtWall = h.acquiredAtWall();
+                s.acquiredAtMono = h.acquiredAtMono();
+                s.expiresAtMono = h.expiresAtMono();
+                s.released = false;
+                s.revision = h.revision();
+                s.handoverBoundaryToken =
+                        Math.max(s.handoverBoundaryToken, h.supersededToken());
+                trackToken(s, h.fencingToken());
             }
             case WriteApplied w -> {
                 trackToken(s, w.fencingToken());

@@ -33,6 +33,12 @@ public class ResourceState {
     public final Set<Long> issuedTokens = new HashSet<>();
     /** 下一次全新授予使用的令牌，从 1 开始单调递增，只增不减。 */
     public long nextToken = 1L;
+    /**
+     * 计划内交接边界：{@code <=} 该值的令牌都是被交接显式取代的旧令牌。
+     * 交接生效后，这些令牌的提交（含幂等重放）一律以 SUPERSEDED_BY_HANDOVER 拒绝。
+     * 只增不减，0 表示从未发生过交接。
+     */
+    public long handoverBoundaryToken = 0L;
 
     // ---- 写入台账 ----
     public final Map<String, AppliedWrite> appliedWrites = new HashMap<>();

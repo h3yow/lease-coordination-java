@@ -12,6 +12,9 @@ import org.slf4j.LoggerFactory;
  *
  * <p>提交按以下顺序判定，全部在资源的线性化临界区内完成：</p>
  * <ol>
+ *   <li><b>交接边界</b>：令牌 {@code <=} 交接边界（已在计划内交接中被取代）→
+ *       {@link WriteRejectReason#SUPERSEDED_BY_HANDOVER}，优先于幂等重放，
+ *       即使该请求之前成功落过库也绝不放行；</li>
  *   <li><b>幂等重放</b>：幂等键已存在 → 无论令牌是否仍有效，原样返回首次结果，
  *       {@code replay=true}，绝不产生第二次副作用（崩溃前已落盘的提交重放安全）；</li>
  *   <li><b>旧领导 / 过期令牌</b>：令牌从未签发 → {@link WriteRejectReason#UNKNOWN_TOKEN}；
@@ -33,6 +36,18 @@ public class WriteService {
         this.clock = clock;
     }
 
+    /**
+     * 查询资源已提交到的最大副作用序号（交接后继任者据此从已知进度继续写）。
+     * 无任何提交时返回 0。
+     */
+    public long committedSequence(String resourceId) {
+        return store.compute(resourceId, s -> {
+            log.info("[INSPECT-SEQ] resource={} committedSeq={} nowMono={}",
+                    resourceId, s.lastSequence, clock.monotonicMillis());
+            return ClusterStateStore.Result.of(s.lastSequence);
+        });
+    }
+
     public WriteOutcome submit(String resourceId, String nodeId, long fencingToken,
                                String idempotencyKey, String payload) {
         if (idempotencyKey == null || idempotencyKey.isBlank()) {
@@ -41,6 +56,19 @@ public class WriteService {
         long nowMono = clock.monotonicMillis();
 
         return store.compute(resourceId, s -> {
+            // 0) 交接边界优先于一切（含幂等重放）：交接生效后，旧令牌的任何提交一律拒绝，
+            //    即使该幂等键之前确实成功落过库，也绝不按"重复提交"放行
+            if (fencingToken <= s.handoverBoundaryToken) {
+                log.info("[WRITE-拒绝] resource={} node={} key={} token={} 交接边界={} "
+                                + "nowMono={} → SUPERSEDED_BY_HANDOVER（令牌已在计划内交接中被取代，"
+                                + "重放也不放行）",
+                        resourceId, nodeId, idempotencyKey, fencingToken,
+                        s.handoverBoundaryToken, nowMono);
+                throw new CoordinationException(WriteRejectReason.SUPERSEDED_BY_HANDOVER,
+                        "令牌 " + fencingToken + " 已在计划内交接中被取代（交接边界="
+                                + s.handoverBoundaryToken + "），拒绝写入");
+            }
+
             // 1) 幂等重放优先：同一请求重放不产生重复副作用，即使发起者已不是领导
             ResourceState.AppliedWrite prior = s.appliedWrites.get(idempotencyKey);
             if (prior != null) {

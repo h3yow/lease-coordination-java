@@ -11,5 +11,7 @@ public enum LeaseRejectReason {
     /** 对已释放租约重复释放。 */
     ALREADY_RELEASED,
     /** 资源上从未授予过租约（或已被清理）。 */
-    UNKNOWN_LEASE
+    UNKNOWN_LEASE,
+    /** 交接目标非法：继任者为空或与当前持有者相同。 */
+    INVALID_SUCCESSOR
 }

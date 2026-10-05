@@ -87,6 +87,88 @@ public class LeaseService {
         return lease;
     }
 
+    /**
+     * 计划内交接：当前持有者把领导权主动交给指定继任者。
+     *
+     * @param resourceId  资源
+     * @param holderId    发起交接的当前持有者
+     * @param successorId 被指名的继任者
+     * @param ttlMillis   继任者新租约的有效期（从当前单调时刻起）
+     * @return 继任者的新租约（严格更新的栅栏令牌，立即生效，不等旧租约到期）
+     * @throws CoordinationException 拒绝原因可区分：UNKNOWN_LEASE / NOT_HOLDER /
+     *                               ALREADY_RELEASED / EXPIRED / INVALID_SUCCESSOR
+     */
+    public Lease handover(String resourceId, String holderId, String successorId,
+                          long ttlMillis) {
+        if (ttlMillis <= 0) {
+            throw new IllegalArgumentException("ttlMillis 必须为正数: " + ttlMillis);
+        }
+        long nowMono = clock.monotonicMillis();
+        long nowWall = clock.wallClockMillis();
+
+        Lease lease = store.compute(resourceId, s -> {
+            if (!s.hasLease) {
+                log.info("[HANDOVER-拒绝] resource={} initiator={} successor={} nowMono={} "
+                                + "→ UNKNOWN_LEASE", resourceId, holderId, successorId, nowMono);
+                throw new CoordinationException(LeaseRejectReason.UNKNOWN_LEASE,
+                        "资源 " + resourceId + " 上不存在租约，无法交接");
+            }
+            if (!holderId.equals(s.holderId)) {
+                log.info("[HANDOVER-拒绝] resource={} initiator={} 实际持有者={} token={} "
+                                + "→ NOT_HOLDER", resourceId, holderId, s.holderId,
+                        s.fencingToken);
+                throw new CoordinationException(LeaseRejectReason.NOT_HOLDER,
+                        "节点 " + holderId + " 不是资源 " + resourceId + " 的持有者，无权发起交接");
+            }
+            if (s.released) {
+                log.info("[HANDOVER-拒绝] resource={} initiator={} token={} "
+                                + "→ ALREADY_RELEASED", resourceId, holderId, s.fencingToken);
+                throw new CoordinationException(LeaseRejectReason.ALREADY_RELEASED,
+                        "租约 token=" + s.fencingToken + " 已被释放，无法交接");
+            }
+            if (s.expiresAtMono <= nowMono) {
+                log.info("[HANDOVER-拒绝] resource={} initiator={} token={} 已过期 "
+                                + "(expiresAtMono={} <= nowMono={}) → EXPIRED",
+                        resourceId, holderId, s.fencingToken, s.expiresAtMono, nowMono);
+                throw new CoordinationException(LeaseRejectReason.EXPIRED,
+                        "租约 token=" + s.fencingToken + " 已过期，无法交接，继任者请重新获取");
+            }
+            if (successorId == null || successorId.isBlank()
+                    || successorId.equals(holderId)) {
+                log.info("[HANDOVER-拒绝] resource={} initiator={} successor={} token={} "
+                                + "→ INVALID_SUCCESSOR",
+                        resourceId, holderId, successorId, s.fencingToken);
+                throw new CoordinationException(LeaseRejectReason.INVALID_SUCCESSOR,
+                        "继任者 '" + successorId + "' 非法：不能为空，也不能是当前持有者自己");
+            }
+
+            long oldToken = s.fencingToken;
+            long oldRemaining = s.expiresAtMono - nowMono;
+            long newToken = s.nextToken;
+            s.nextToken++;
+            s.holderId = successorId;
+            s.fencingToken = newToken;
+            s.acquiredAtWall = nowWall;
+            s.acquiredAtMono = nowMono;
+            s.expiresAtMono = nowMono + ttlMillis;
+            s.released = false;
+            s.revision = 1;
+            s.handoverBoundaryToken = Math.max(s.handoverBoundaryToken, oldToken);
+            s.issuedTokens.add(newToken);
+
+            log.info("[HANDOVER-生效] resource={} {} → {} token={}→{} 交接边界={} wall={} "
+                            + "mono={} ttl={}ms 新expiresAtMono={} 旧租约剩余={}ms被提前终止 "
+                            + "→ 继任者立即成为有效持有者，WAL落盘",
+                    resourceId, holderId, successorId, oldToken, newToken,
+                    s.handoverBoundaryToken, nowWall, nowMono, ttlMillis,
+                    s.expiresAtMono, oldRemaining);
+            return ClusterStateStore.Result.of(s.snapshot(resourceId),
+                    new ClusterStateStore.LeaseHandover(successorId, newToken, nowWall,
+                            nowMono, s.expiresAtMono, 1, oldToken));
+        });
+        return lease;
+    }
+
     /** 续约：令牌不变，过期时刻顺延。越权/已释放/已过期一律拒绝。 */
     public Lease renew(String resourceId, String holderId, long ttlMillis) {
         if (ttlMillis <= 0) {
